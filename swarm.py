@@ -370,6 +370,117 @@ def benchmark(
         console.print("[red]✗ No speedup detected. Check node performance.[/]")
 
 
+@app.command()
+def orchestrate(
+    task: str = typer.Argument(None, help="Complex task to decompose and distribute"),
+    task_file: Path = typer.Option(None, "--task-file", "-tf", help="File containing the task description"),
+    agents: int = typer.Option(None, "--agents", "-a", help="Max number of agents to use"),
+    output: Path = typer.Option(None, "--output", "-o", help="Save combined result to file"),
+):
+    """🤖 Orchestrate a complex task across multiple agents on the swarm."""
+    from orchestrator import (
+        detect_task_type,
+        create_task_plan,
+        execute_plan,
+        check_nodes,
+    )
+    from rich.tree import Tree
+    from rich.markdown import Markdown
+
+    # Get task
+    if task_file:
+        if not task_file.exists():
+            console.print(f"[red]File not found:[/] {task_file}")
+            raise typer.Exit(1)
+        task = task_file.read_text().strip()
+    elif not task:
+        console.print("[red]Provide a task or --task-file[/]")
+        raise typer.Exit(1)
+
+    # Detect task type
+    task_type = detect_task_type(task)
+    console.print(
+        Panel(
+            f"[bold]Task:[/] {task}\n"
+            f"[bold]Type detected:[/] {task_type}\n"
+            f"[bold]Max agents:[/] {agents or 'auto'}",
+            title="🤖 SwarmAI Orchestrator",
+            box=box.ROUNDED,
+        )
+    )
+
+    # Check nodes
+    nodes = load_nodes()
+    alive = asyncio.run(check_nodes(nodes))
+
+    if not alive:
+        console.print("[red]No nodes are online! Start workers first.[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]{len(alive)} node(s) online.[/]\n")
+
+    # Create plan
+    plan = create_task_plan(task, max_agents=agents)
+
+    # Show plan
+    tree = Tree(f"🎯 [bold]Task Plan[/] — {len(plan.subtasks)} agents")
+    for st in plan.subtasks:
+        node = alive[st.id % len(alive)].split("//")[1]
+        tree.add(f"[cyan]{st.role}[/] → {st.description} [dim]({node})[/]")
+    console.print(tree)
+    console.print()
+
+    # Execute
+    console.print("[bold yellow]⏳ Executing all agents in parallel...[/]\n")
+    plan = asyncio.run(execute_plan(plan, alive))
+
+    # Show results per agent
+    for st in plan.subtasks:
+        node_short = st.node.split("//")[1] if st.node else "unknown"
+        if st.error:
+            console.print(
+                Panel(
+                    f"[red]ERROR: {st.error}[/]",
+                    title=f"❌ {st.role} [{node_short}]",
+                    box=box.ROUNDED,
+                )
+            )
+        else:
+            # Truncate for display
+            preview = st.result[:500] + "..." if len(st.result) > 500 else st.result
+            console.print(
+                Panel(
+                    preview,
+                    title=f"✅ {st.role} [{node_short}] — {st.time:.1f}s",
+                    box=box.ROUNDED,
+                )
+            )
+        console.print()
+
+    # Summary
+    successful = sum(1 for st in plan.subtasks if not st.error)
+    console.print(
+        Panel(
+            f"Task: {plan.original_task}\n"
+            f"Agents: {successful}/{len(plan.subtasks)} completed\n"
+            f"Nodes used: {len(alive)}\n"
+            f"Total time: {plan.total_time:.1f}s\n"
+            f"Avg per agent: {plan.total_time / len(plan.subtasks):.1f}s",
+            title="📊 Orchestration Summary",
+            box=box.ROUNDED,
+        )
+    )
+
+    # Save full output if requested
+    if output:
+        output.write_text(plan.final_result)
+        console.print(f"\n[green]✓ Full result saved to:[/] {output}")
+    else:
+        console.print(
+            "\n[dim]Tip: Use --output result.md to save the full combined output.[/]"
+        )
+
+
 # ─── Entry Point ─────────────────────────────────────────────────
 
 if __name__ == "__main__":

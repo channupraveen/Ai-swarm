@@ -1,0 +1,10 @@
+What is Python?
+What is JavaScript?
+Explain Docker in one line.
+What is an API?
+What is machine learning?
+Explain microservices in simple terms.
+What is a database index?
+What is WebSocket?
+What is REST?
+Explain cloud computing briefly.

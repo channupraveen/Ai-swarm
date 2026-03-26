@@ -83,8 +83,8 @@ Results merged → returned to user
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/swarm-ai.git
-cd swarm-ai
+git clone https://github.com/channupraveen/Ai-swarm.git
+cd Ai-swarm
 ```
 
 ### 2. Install dependencies

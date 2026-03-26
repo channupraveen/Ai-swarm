@@ -7,7 +7,7 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Channu Praveen",
-    url="https://github.com/YOUR_USERNAME/swarm-ai",
+    url="https://github.com/channupraveen/Ai-swarm",
     py_modules=["swarm", "worker"],
     python_requires=">=3.10",
     install_requires=[

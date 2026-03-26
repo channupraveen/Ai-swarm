@@ -8,6 +8,8 @@
 
 ---
 
+> **Unlike cloud-based agent frameworks, SwarmAI runs entirely on your local network — no API keys, no cloud costs, full privacy.**
+
 ## What is SwarmAI?
 
 SwarmAI is a distributed compute runtime for local LLM models. It allows multiple computers on a network to share AI workload — turning idle machines into a powerful inference cluster.

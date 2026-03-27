@@ -2,34 +2,23 @@
 SwarmAI CLI — Distributed AI Compute Runtime
 =============================================
 
-Commands:
+LOCAL commands:
     python swarm.py start              → Start a worker node on this machine
-    python swarm.py status             → Check which nodes are alive (with queue depth)
-    python swarm.py run "prompt"       → Send prompts to the swarm
-    python swarm.py run -f file.txt    → Distribute prompts from a file
-    python swarm.py benchmark          → Compare 1 node vs all nodes speed
-    python swarm.py nodes --list       → Show configured nodes
-    python swarm.py nodes --add URL    → Add a node
-    python swarm.py orchestrate "task" → Decompose and run complex tasks
+    python swarm.py status             → Check local nodes alive
+    python swarm.py run "prompt"       → Send prompt to local swarm
+    python swarm.py benchmark          → Speed comparison
+    python swarm.py orchestrate "task" → Multi-agent task
 
-Setup:
-    pip install -r requirements.txt
-    ollama pull phi3:mini
-
-FIX LOG (v0.2.0):
-    - orchestrate: live per-agent progress panel that updates as each agent
-      finishes instead of printing everything at the end.
-    - orchestrate: shows queue wait time and attempt count per agent.
-    - status: shows queue_depth from /health so you can see node load.
-    - benchmark: works correctly with a single node (sequential self-compare).
-    - run: shows per-prompt timing breakdown (wait vs generation).
-    - Removed global timeout=180 from distribute_prompts — worker now has its
-      own semaphore; client just needs to wait patiently.
+INTERNET SWARM commands:
+    python swarm.py coordinator-start          → Start coordinator (on VPS)
+    python swarm.py coordinator-status URL KEY → Check coordinator + nodes
+    python swarm.py coordinator-run URL KEY    → Send prompt via coordinator
 """
 
 import asyncio
 import time
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -39,11 +28,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.live import Live
-from rich.columns import Columns
 from rich import box
-
-# ─── Configuration ───────────────────────────────────────────────
 
 CONFIG_FILE = Path("swarm_nodes.json")
 DEFAULT_MODEL = "phi3:mini"
@@ -55,22 +40,16 @@ DEFAULT_NODES = [
     "http://192.168.86.6:8100",
 ]
 
-app = typer.Typer(
-    name="swarm",
-    help="🐝 SwarmAI — Distributed AI Compute Runtime",
-    add_completion=False,
-)
+app = typer.Typer(name="swarm", help="🐝 SwarmAI — Distributed AI Compute Runtime", add_completion=False)
 console = Console()
 
 
 # ─── Node Config ─────────────────────────────────────────────────
 
-
 def load_nodes() -> list[str]:
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            data = json.load(f)
-            return data.get("nodes", DEFAULT_NODES)
+            return json.load(f).get("nodes", DEFAULT_NODES)
     return DEFAULT_NODES
 
 
@@ -81,29 +60,20 @@ def save_nodes(nodes: list[str]):
 
 # ─── Node Health ─────────────────────────────────────────────────
 
-
 async def check_node(client: httpx.AsyncClient, url: str) -> dict:
-    """Ping a node and return its health details including queue depth."""
     try:
         resp = await client.get(f"{url}/health", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            return {
-                "url": url,
-                "status": "online",
-                "queue_depth": data.get("queue_depth", 0),
-                "requests_served": data.get("requests_served", 0),
-            }
-        return {"url": url, "status": "error", "detail": str(resp.status_code)}
+            return {"url": url, "status": "online", "queue_depth": data.get("queue_depth", 0), "requests_served": data.get("requests_served", 0)}
+        return {"url": url, "status": "error"}
     except Exception as e:
         return {"url": url, "status": "offline", "detail": str(e)}
 
 
 async def get_alive_nodes(nodes: list[str]) -> list[str]:
-    """Return only online nodes, sorted least-busy first."""
     async with httpx.AsyncClient() as client:
         checks = await asyncio.gather(*[check_node(client, n) for n in nodes])
-
     alive = [c for c in checks if c["status"] == "online"]
     alive.sort(key=lambda c: c.get("queue_depth", 0))
     return [c["url"] for c in alive]
@@ -111,109 +81,55 @@ async def get_alive_nodes(nodes: list[str]) -> list[str]:
 
 # ─── Prompt Distribution ─────────────────────────────────────────
 
-
-async def send_prompt(
-    client: httpx.AsyncClient, node_url: str, prompt: str, index: int
-) -> dict:
-    """Send a single prompt to a worker node. Worker handles its own queuing."""
+async def send_prompt(client: httpx.AsyncClient, node_url: str, prompt: str, index: int) -> dict:
     start = time.time()
     try:
-        response = await client.post(
-            f"{node_url}/generate",
-            json={"prompt": prompt, "model": DEFAULT_MODEL},
-        )
+        response = await client.post(f"{node_url}/generate", json={"prompt": prompt, "model": DEFAULT_MODEL})
         elapsed = time.time() - start
         result = response.json()
-        return {
-            "index": index,
-            "prompt": prompt,
-            "response": result.get("response", ""),
-            "wait_time": result.get("wait_time", 0),
-            "gen_time": result.get("gen_time", elapsed),
-            "node": node_url,
-            "time": elapsed,
-        }
+        return {"index": index, "prompt": prompt, "response": result.get("response", ""), "wait_time": result.get("wait_time", 0), "gen_time": result.get("gen_time", elapsed), "node": node_url, "time": elapsed}
     except Exception as e:
-        elapsed = time.time() - start
-        return {
-            "index": index,
-            "prompt": prompt,
-            "error": str(e),
-            "node": node_url,
-            "time": elapsed,
-        }
+        return {"index": index, "prompt": prompt, "error": str(e), "node": node_url, "time": time.time() - start}
 
 
-async def distribute_prompts(
-    prompts: list[str], nodes: list[str]
-) -> list[dict]:
-    """
-    Distribute prompts across nodes using round-robin.
-    Worker semaphores handle queuing — we just dispatch and wait.
-    Timeout is generous: worker max generation time (900s) + 60s buffer.
-    """
+async def distribute_prompts(prompts: list[str], nodes: list[str]) -> list[dict]:
     tasks = []
     async with httpx.AsyncClient(timeout=960) as client:
         for i, prompt in enumerate(prompts):
-            node = nodes[i % len(nodes)]
-            tasks.append(send_prompt(client, node, prompt, i))
+            tasks.append(send_prompt(client, nodes[i % len(nodes)], prompt, i))
         results = await asyncio.gather(*tasks)
     return sorted(results, key=lambda x: x["index"])
 
 
-# ─── CLI Commands ────────────────────────────────────────────────
-
+# ─── LOCAL CLI Commands ───────────────────────────────────────────
 
 @app.command()
-def start(
-    port: int = typer.Option(WORKER_PORT, help="Port to run the worker on"),
-):
+def start(port: int = typer.Option(WORKER_PORT, help="Port to run the worker on")):
     """🚀 Start a worker node on this machine."""
     import uvicorn
     from worker import app as worker_app
-
-    console.print(
-        Panel(
-            f"[bold green]Starting SwarmAI Worker Node[/]\n"
-            f"Port: {port}\n"
-            f"Model: {DEFAULT_MODEL}\n"
-            f"Ollama: {OLLAMA_URL}",
-            title="🐝 SwarmAI Node",
-            box=box.ROUNDED,
-        )
-    )
+    console.print(Panel(f"[bold green]Starting SwarmAI Worker Node[/]\nPort: {port}\nModel: {DEFAULT_MODEL}", title="🐝 SwarmAI Node", box=box.ROUNDED))
     uvicorn.run(worker_app, host="0.0.0.0", port=port)
 
 
 @app.command()
 def status():
-    """📡 Check which nodes are alive with queue depth."""
-
+    """📡 Check which local nodes are alive."""
     async def _check():
         async with httpx.AsyncClient() as client:
             return await asyncio.gather(*[check_node(client, n) for n in load_nodes()])
-
     results = asyncio.run(_check())
-
     table = Table(title="🐝 SwarmAI Node Status", box=box.ROUNDED)
     table.add_column("Node", style="cyan")
     table.add_column("Status", style="bold")
     table.add_column("Queue", justify="center")
     table.add_column("Served", justify="right", style="dim")
-
     for r in results:
         if r["status"] == "online":
-            status_str = "[green]● ONLINE[/]"
-            queue = str(r.get("queue_depth", "?"))
-            served = str(r.get("requests_served", "?"))
+            table.add_row(r["url"], "[green]● ONLINE[/]", str(r.get("queue_depth","?")), str(r.get("requests_served","?")))
         else:
-            status_str = "[red]● OFFLINE[/]"
-            queue = "-"
-            served = "-"
-        table.add_row(r["url"], status_str, queue, served)
-
+            table.add_row(r["url"], "[red]● OFFLINE[/]", "-", "-")
     console.print(table)
-
     online = sum(1 for r in results if r["status"] == "online")
     console.print(f"\n[bold]{online}/{len(results)}[/] nodes available.\n")
 
@@ -222,29 +138,24 @@ def status():
 def nodes(
     add: str = typer.Option(None, help="Add a node URL"),
     remove: str = typer.Option(None, help="Remove a node URL"),
-    show: bool = typer.Option(False, "--list", help="List all configured nodes"),
+    show: bool = typer.Option(False, "--list", help="List nodes"),
 ):
-    """⚙️  Manage node list (add/remove/list)."""
+    """⚙️  Manage node list."""
     current = load_nodes()
-
     if add:
         if add not in current:
             current.append(add)
             save_nodes(current)
-            console.print(f"[green]✓ Added node:[/] {add}")
+            console.print(f"[green]✓ Added:[/] {add}")
         else:
-            console.print(f"[yellow]Node already exists:[/] {add}")
+            console.print(f"[yellow]Already exists:[/] {add}")
         return
-
     if remove:
         if remove in current:
             current.remove(remove)
             save_nodes(current)
-            console.print(f"[red]✓ Removed node:[/] {remove}")
-        else:
-            console.print(f"[yellow]Node not found:[/] {remove}")
+            console.print(f"[red]✓ Removed:[/] {remove}")
         return
-
     table = Table(title="Configured Nodes", box=box.SIMPLE)
     table.add_column("#", style="dim")
     table.add_column("URL", style="cyan")
@@ -255,16 +166,13 @@ def nodes(
 
 @app.command()
 def run(
-    prompt: str = typer.Argument(None, help="Single prompt to run"),
-    file: Path = typer.Option(None, "--file", "-f", help="File with one prompt per line"),
+    prompt: str = typer.Argument(None),
+    file: Path = typer.Option(None, "--file", "-f"),
 ):
-    """🧠 Send prompts to the swarm for distributed processing."""
+    """🧠 Send prompts to local swarm."""
     prompts = []
     if file:
-        if not file.exists():
-            console.print(f"[red]File not found:[/] {file}")
-            raise typer.Exit(1)
-        prompts = [line.strip() for line in file.read_text().splitlines() if line.strip()]
+        prompts = [l.strip() for l in file.read_text().splitlines() if l.strip()]
     elif prompt:
         prompts = [prompt]
     else:
@@ -272,18 +180,13 @@ def run(
         raise typer.Exit(1)
 
     nodes_list = load_nodes()
-
-    with Progress(SpinnerColumn(), TextColumn("[bold]Checking nodes..."), console=console) as progress:
-        progress.add_task("check", total=None)
+    with Progress(SpinnerColumn(), TextColumn("[bold]Checking nodes..."), console=console) as p:
+        p.add_task("check", total=None)
         alive = asyncio.run(get_alive_nodes(nodes_list))
 
     if not alive:
-        console.print("[red]No nodes are online! Start workers first.[/]")
+        console.print("[red]No nodes online.[/]")
         raise typer.Exit(1)
-
-    console.print(
-        f"[green]{len(alive)} node(s) online.[/] Distributing [bold]{len(prompts)}[/] prompt(s)...\n"
-    )
 
     start_time = time.time()
     results = asyncio.run(distribute_prompts(prompts, alive))
@@ -292,241 +195,211 @@ def run(
     for r in results:
         node_short = r["node"].split("//")[1]
         if "error" in r:
-            console.print(f"[red]✗ [{node_short}][/] Error: {r['error']}\n")
+            console.print(f"[red]✗ [{node_short}][/] {r['error']}\n")
         else:
-            gen = r.get("gen_time", r["time"])
-            wait = r.get("wait_time", 0)
-            timing = f"[dim]{gen:.1f}s gen"
-            if wait > 0.5:
-                timing += f", {wait:.1f}s queued"
-            timing += "[/]"
-            console.print(f"[green]✓ [{node_short}][/] {timing}")
+            console.print(f"[green]✓ [{node_short}][/] [dim]{r.get('gen_time',r['time']):.1f}s[/]")
             console.print(f"  Q: {r['prompt']}")
-            console.print(f"  A: {r['response'][:200].replace(chr(10), ' ')}\n")
+            console.print(f"  A: {r['response'][:200]}\n")
 
-    console.print(
-        Panel(
-            f"Prompts: {len(prompts)}\n"
-            f"Nodes used: {len(alive)}\n"
-            f"Total time: {total_time:.1f}s\n"
-            f"Avg per prompt: {total_time / len(prompts):.1f}s",
-            title="📊 Summary",
-            box=box.ROUNDED,
-        )
-    )
+    console.print(Panel(f"Prompts: {len(prompts)}\nNodes: {len(alive)}\nTotal: {total_time:.1f}s", title="📊 Summary", box=box.ROUNDED))
 
 
 @app.command()
-def benchmark(
-    count: int = typer.Option(4, "--count", "-c", help="Number of prompts to benchmark"),
-):
-    """⚡ Compare 1 node vs full swarm speed (works with 1 or more nodes)."""
-    test_prompts = [
-        "What is Python?",
-        "What is JavaScript?",
-        "Explain Docker in one line.",
-        "What is an API?",
-        "What is machine learning?",
-        "Explain microservices.",
-        "What is a database index?",
-        "What is WebSocket?",
-    ][:count]
-
-    nodes_list = load_nodes()
-    alive = asyncio.run(get_alive_nodes(nodes_list))
-
+def benchmark(count: int = typer.Option(4, "--count", "-c")):
+    """⚡ Compare 1-node vs full swarm speed."""
+    test_prompts = ["What is Python?", "What is Docker?", "What is an API?", "What is ML?"][:count]
+    alive = asyncio.run(get_alive_nodes(load_nodes()))
     if not alive:
-        console.print("[red]No nodes online. Start workers first.[/]")
+        console.print("[red]No nodes online.[/]")
         raise typer.Exit(1)
 
-    console.print(
-        Panel(
-            f"Prompts: {len(test_prompts)}\n"
-            f"Nodes available: {len(alive)}\n"
-            + ("[yellow]Only 1 node — comparing sequential vs parallel on same node.[/]" if len(alive) == 1 else "Running single-node then multi-node test..."),
-            title="⚡ SwarmAI Benchmark",
-            box=box.ROUNDED,
-        )
-    )
-
-    # ── Test 1: Single node, sequential ──────────────────────────
-    console.print("\n[bold yellow]▶ Test 1: Single node (sequential)...[/]")
+    console.print(f"\n[bold yellow]▶ Single node...[/]")
     start = time.time()
-    single_results = asyncio.run(distribute_prompts(test_prompts, [alive[0]]))
+    asyncio.run(distribute_prompts(test_prompts, [alive[0]]))
     single_time = time.time() - start
-    console.print(f"  Done in [bold]{single_time:.1f}s[/]\n")
 
     if len(alive) < 2:
-        # Only 1 node — show per-prompt timing so user understands the baseline
-        table = Table(title="Single Node Timing", box=box.SIMPLE)
-        table.add_column("Prompt", style="cyan", max_width=40)
-        table.add_column("Time", justify="right")
-        for r in single_results:
-            table.add_row(r["prompt"], f"{r['time']:.1f}s")
-        console.print(table)
-        console.print(
-            f"\n[yellow]Add a second node with:[/] python swarm.py nodes --add http://OTHER_IP:8100\n"
-            f"[yellow]Then run benchmark again to see speedup.[/]"
-        )
+        console.print(f"  Done in {single_time:.1f}s\n[yellow]Add more nodes to compare.[/]")
         return
 
-    # ── Test 2: Full swarm ────────────────────────────────────────
-    console.print(f"[bold green]▶ Test 2: {len(alive)} nodes (parallel)...[/]")
+    console.print(f"[bold green]▶ Full swarm ({len(alive)} nodes)...[/]")
     start = time.time()
-    multi_results = asyncio.run(distribute_prompts(test_prompts, alive))
+    asyncio.run(distribute_prompts(test_prompts, alive))
     multi_time = time.time() - start
-    console.print(f"  Done in [bold]{multi_time:.1f}s[/]\n")
 
     speedup = single_time / multi_time if multi_time > 0 else 0
-
-    table = Table(title="Benchmark Results", box=box.ROUNDED)
+    table = Table(box=box.ROUNDED)
     table.add_column("Test", style="cyan")
-    table.add_column("Nodes", justify="center")
     table.add_column("Time", justify="right", style="bold")
-    table.add_column("Avg/prompt", justify="right")
-    table.add_row("Single node", "1", f"{single_time:.1f}s", f"{single_time / len(test_prompts):.1f}s")
-    table.add_row("Full swarm", str(len(alive)), f"{multi_time:.1f}s", f"{multi_time / len(test_prompts):.1f}s")
+    table.add_column("Speedup", justify="right")
+    table.add_row("Single node", f"{single_time:.1f}s", "1.0x")
+    table.add_row(f"Full swarm ({len(alive)})", f"{multi_time:.1f}s", f"[green]{speedup:.2f}x[/]")
     console.print(table)
-
-    color = "green" if speedup > 1.3 else "yellow" if speedup > 1.0 else "red"
-    console.print(f"\n[bold {color}]⚡ Speedup: {speedup:.2f}x[/]\n")
-
-    if speedup > 1.3:
-        console.print("[green]✓ Distributed compute is faster![/]")
-    elif speedup > 1.0:
-        console.print("[yellow]~ Slight improvement. More prompts will show bigger gains.[/]")
-    else:
-        console.print("[red]✗ No speedup detected. Check node performance.[/]")
 
 
 @app.command()
 def orchestrate(
-    task: str = typer.Argument(None, help="Complex task to decompose and distribute"),
-    task_file: Path = typer.Option(None, "--task-file", "-tf", help="File with task description"),
-    agents: int = typer.Option(None, "--agents", "-a", help="Max number of agents"),
-    output: Path = typer.Option(None, "--output", "-o", help="Save combined result to file"),
+    task: str = typer.Argument(None),
+    task_file: Path = typer.Option(None, "--task-file", "-tf"),
+    agents: int = typer.Option(None, "--agents", "-a"),
+    output: Path = typer.Option(None, "--output", "-o"),
 ):
-    """🤖 Orchestrate a complex task across multiple agents on the swarm."""
+    """🤖 Decompose and run a complex task across agents."""
     from orchestrator import detect_task_type, create_task_plan, execute_plan, check_nodes
     from rich.tree import Tree
 
-    # ── Get task ─────────────────────────────────────────────────
     if task_file:
-        if not task_file.exists():
-            console.print(f"[red]File not found:[/] {task_file}")
-            raise typer.Exit(1)
         task = task_file.read_text().strip()
     elif not task:
-        console.print("[red]Provide a task or --task-file[/]")
+        console.print("[red]Provide a task.[/]")
         raise typer.Exit(1)
 
     task_type = detect_task_type(task)
-    console.print(
-        Panel(
-            f"[bold]Task:[/] {task}\n"
-            f"[bold]Type detected:[/] {task_type}\n"
-            f"[bold]Max agents:[/] {agents or 'auto'}",
-            title="🤖 SwarmAI Orchestrator",
-            box=box.ROUNDED,
-        )
-    )
+    console.print(Panel(f"[bold]Task:[/] {task}\n[bold]Type:[/] {task_type}\n[bold]Agents:[/] {agents or 'auto'}", title="🤖 SwarmAI Orchestrator", box=box.ROUNDED))
 
-    # ── Check nodes ───────────────────────────────────────────────
-    nodes_list = load_nodes()
-    alive = asyncio.run(check_nodes(nodes_list))
-
+    alive = asyncio.run(check_nodes(load_nodes()))
     if not alive:
-        console.print("[red]No nodes are online! Start workers first.[/]")
+        console.print("[red]No nodes online.[/]")
         raise typer.Exit(1)
 
     node_count = len(alive)
     console.print(f"[green]{node_count} node(s) online.[/]\n")
-
     if node_count == 1:
-        console.print(
-            "[yellow]⚠ Only 1 node available — agents will run sequentially (no 504s).[/]\n"
-            "[dim]Add more nodes for true parallel execution.[/]\n"
-        )
+        console.print("[yellow]⚠ 1 node — agents run sequentially.[/]\n")
 
-    # ── Show plan ─────────────────────────────────────────────────
     plan = create_task_plan(task, max_agents=agents)
-
     tree = Tree(f"🎯 [bold]Task Plan[/] — {len(plan.subtasks)} agents")
     for i, st in enumerate(plan.subtasks):
-        assigned_node = alive[i % node_count].split("//")[1]
-        tree.add(f"[cyan]{st.role}[/] → {st.description} [dim]({assigned_node})[/]")
+        tree.add(f"[cyan]{st.role}[/] → {st.description} [dim]({alive[i % node_count].split('//')[1]})[/]")
     console.print(tree)
     console.print()
 
-    # ── Live execution display ────────────────────────────────────
-    # Track agent status for live display
-    agent_status: dict[int, str] = {st.id: "⏳ waiting" for st in plan.subtasks}
     lock = threading.Lock()
-
-    def on_agent_complete(subtask):
+    def on_complete(subtask):
         with lock:
-            if subtask.error:
-                agent_status[subtask.id] = f"[red]❌ {subtask.error[:60]}[/]"
-            else:
-                timing = f"{subtask.time:.1f}s"
-                if subtask.wait_time > 0.5:
-                    timing += f" ({subtask.wait_time:.1f}s queued)"
-                agent_status[subtask.id] = f"[green]✅ done in {timing}[/]"
+            status = f"[green]✅ {subtask.time:.1f}s[/]" if not subtask.error else f"[red]❌ {subtask.error[:50]}[/]"
+            console.print(f"  {subtask.role}: {status}")
 
     console.print("[bold yellow]⏳ Executing agents...[/]\n")
+    plan = asyncio.run(execute_plan(plan, alive, on_complete=on_complete))
+    console.print()
 
-    # Run with live status
-    plan = asyncio.run(execute_plan(plan, alive, on_complete=on_agent_complete))
-
-    # ── Print per-agent results ───────────────────────────────────
     for st in plan.subtasks:
-        node_short = st.node.split("//")[1] if st.node else "unknown"
+        node_short = st.node.split("//")[1] if st.node else "?"
         if st.error:
-            console.print(
-                Panel(
-                    f"[red]ERROR: {st.error}[/]",
-                    title=f"❌ {st.role} [{node_short}]",
-                    box=box.ROUNDED,
-                )
-            )
+            console.print(Panel(f"[red]{st.error}[/]", title=f"❌ {st.role} [{node_short}]", box=box.ROUNDED))
         else:
-            timing_line = f"[dim]{st.time:.1f}s generation"
-            if st.wait_time > 0.5:
-                timing_line += f", {st.wait_time:.1f}s queued"
-            if st.attempts > 1:
-                timing_line += f", {st.attempts} attempts"
-            timing_line += "[/]"
-
             preview = st.result[:500] + "..." if len(st.result) > 500 else st.result
-            console.print(
-                Panel(
-                    f"{timing_line}\n\n{preview}",
-                    title=f"✅ {st.role} [{node_short}]",
-                    box=box.ROUNDED,
-                )
-            )
+            console.print(Panel(f"[dim]{st.time:.1f}s gen[/]\n\n{preview}", title=f"✅ {st.role} [{node_short}]", box=box.ROUNDED))
         console.print()
 
-    # ── Summary ───────────────────────────────────────────────────
     successful = sum(1 for st in plan.subtasks if not st.error)
-    failed = len(plan.subtasks) - successful
-
-    summary = (
-        f"Task: {plan.original_task}\n"
-        f"Agents: [green]{successful}[/] completed"
-        + (f", [red]{failed} failed[/]" if failed else "")
-        + f"\nNodes used: {node_count}\n"
-        f"Total time: {plan.total_time:.1f}s\n"
-        f"Avg per agent: {plan.total_time / len(plan.subtasks):.1f}s"
-    )
-
-    console.print(Panel(summary, title="📊 Orchestration Summary", box=box.ROUNDED))
+    console.print(Panel(
+        f"Agents: [green]{successful}[/]/{len(plan.subtasks)} completed\n"
+        f"Nodes: {node_count} | Total: {plan.total_time:.1f}s",
+        title="📊 Summary", box=box.ROUNDED
+    ))
 
     if output:
         output.write_text(plan.final_result)
-        console.print(f"\n[green]✓ Full result saved to:[/] {output}")
-    else:
-        console.print("\n[dim]Tip: Use --output result.md to save the full combined output.[/]")
+        console.print(f"\n[green]✓ Saved to:[/] {output}")
+
+
+# ─── INTERNET SWARM Commands ──────────────────────────────────────
+
+@app.command()
+def coordinator_start(
+    port: int = typer.Option(8200, help="Port for coordinator"),
+):
+    """🌐 Start the coordinator server (run this on your VPS)."""
+    import uvicorn
+    from coordinator import app as coord_app
+    api_key = os.environ.get("SWARM_API_KEY", "swarm-dev-key-change-in-production")
+    console.print(Panel(
+        f"[bold green]Starting SwarmAI Coordinator[/]\n"
+        f"Port: {port}\n"
+        f"API Key: {api_key}\n\n"
+        f"[yellow]Set SWARM_API_KEY env var before running in production![/]",
+        title="🌐 SwarmAI Coordinator", box=box.ROUNDED
+    ))
+    uvicorn.run(coord_app, host="0.0.0.0", port=port)
+
+
+@app.command()
+def coordinator_status(
+    coordinator_url: str = typer.Argument(..., help="Coordinator URL e.g. http://VPS_IP:8200"),
+    api_key: str = typer.Option(..., "--key", "-k", help="API key"),
+):
+    """📡 Check coordinator status and list registered internet nodes."""
+    async def _check():
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Root (public)
+            root = await client.get(coordinator_url)
+            root_data = root.json()
+
+            # Nodes (auth required)
+            nodes_resp = await client.get(f"{coordinator_url}/nodes", headers={"X-Api-Key": api_key})
+            nodes_data = nodes_resp.json()
+            return root_data, nodes_data
+
+    try:
+        root_data, nodes_data = asyncio.run(_check())
+    except Exception as e:
+        console.print(f"[red]Cannot reach coordinator: {e}[/]")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"Nodes online: [green]{root_data.get('nodes_online', 0)}[/]\n"
+        f"Nodes total: {root_data.get('nodes_total', 0)}\n"
+        f"Version: {root_data.get('version','?')}",
+        title=f"🌐 Coordinator: {coordinator_url}", box=box.ROUNDED
+    ))
+
+    table = Table(title="Registered Internet Nodes", box=box.ROUNDED)
+    table.add_column("Node URL", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Queue", justify="center")
+    table.add_column("Served", justify="right")
+    table.add_column("Last Heartbeat", justify="right", style="dim")
+
+    for node in nodes_data.get("nodes", []):
+        alive = node.get("alive", False)
+        table.add_row(
+            node["url"],
+            "[green]● ALIVE[/]" if alive else "[red]● DEAD[/]",
+            str(node.get("queue_depth", 0)),
+            str(node.get("requests_served", 0)),
+            f"{node.get('last_heartbeat', '?')}s ago",
+        )
+    console.print(table)
+
+
+@app.command()
+def coordinator_run(
+    prompt: str = typer.Argument(..., help="Prompt to send"),
+    coordinator_url: str = typer.Option(..., "--coordinator", "-c", help="Coordinator URL"),
+    api_key: str = typer.Option(..., "--key", "-k", help="API key"),
+):
+    """🧠 Send a prompt via coordinator (routes to best internet node)."""
+    async def _run():
+        async with httpx.AsyncClient(timeout=360) as client:
+            resp = await client.post(
+                f"{coordinator_url}/route",
+                json={"prompt": prompt, "model": DEFAULT_MODEL},
+                headers={"X-Api-Key": api_key},
+            )
+            return resp.json()
+
+    console.print(f"[yellow]Routing via coordinator...[/]")
+    try:
+        result = asyncio.run(_run())
+        console.print(Panel(
+            f"[dim]Node used: {result.get('node_used','?')} | Time: {result.get('gen_time',0):.1f}s[/]\n\n"
+            f"{result.get('response','')}",
+            title="🧠 Response", box=box.ROUNDED
+        ))
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/]")
 
 
 # ─── Entry Point ─────────────────────────────────────────────────
